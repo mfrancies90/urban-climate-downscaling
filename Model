@@ -1,0 +1,996 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchsde
+
+class DoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels, mid_channels=None):
+        super().__init__()
+        if not mid_channels:
+            mid_channels = out_channels
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.double_conv(x)
+
+class Down(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.maxpool_conv = nn.Sequential(
+            nn.MaxPool2d(2),
+            DoubleConv(in_channels, out_channels)
+        )
+
+    def forward(self, x):
+        return self.maxpool_conv(x)
+
+class Up(nn.Module):
+    def __init__(self, in_channels, out_channels, bilinear=True):
+        super().__init__()
+        if bilinear:
+            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+            self.conv = DoubleConv(in_channels, out_channels, in_channels // 2)
+        else:
+            self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
+            self.conv = DoubleConv(in_channels, out_channels)
+
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        # input is CHW
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
+
+        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
+                        diffY // 2, diffY - diffY // 2])
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv(x)
+
+class OutConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        return self.conv(x)
+
+# CORRECTED UNet that matches your saved SPIDM model EXACTLY
+class UNet(nn.Module):
+    def __init__(self, n_channels, n_classes, bilinear=True):
+        super(UNet, self).__init__()
+        self.n_channels = n_channels
+        self.n_classes = n_classes
+        self.bilinear = bilinear
+
+        self.inc = DoubleConv(n_channels, 64)
+        self.down1 = Down(64, 128)
+        self.down2 = Down(128, 256)
+        factor = 2 if bilinear else 1
+        self.down3 = Down(256, 512 // factor)
+
+        # CRITICAL FIX: Based on your saved model architecture
+        # up1: input 512, output 128 (NOT 256!)
+        # up2: input 256, output 64 (NOT 128!)
+        # up3: input 128, output 64
+        self.up1 = Up(512, 128, bilinear)  # 512 -> 128 (matches saved model)
+        self.up2 = Up(256, 64, bilinear)   # 256 -> 64 (matches saved model)
+        self.up3 = Up(128, 64, bilinear)   # 128 -> 64
+        self.outc = OutConv(64, n_classes)
+
+    def forward(self, x):
+        x1 = self.inc(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        x = self.up1(x4, x3)
+        x = self.up2(x, x2)
+        x = self.up3(x, x1)
+        return self.outc(x)
+
+# CORRECTED SPIDM with the exact UNet architecture from your saved model
+class SPIDM(nn.Module):
+    sde_type = 'stratonovich'
+    noise_type = 'diagonal'
+
+    def __init__(self, n_channels_in, n_channels_out, H, W):
+        super().__init__()
+        self.C, self.H, self.W = n_channels_in, H, W
+
+        # Use the corrected UNet architecture
+        self.drift_net = UNet(n_channels_in, n_channels_out)
+
+        # Diffusion network
+        self.diffusion_net = nn.Sequential(
+            nn.Conv2d(n_channels_in, 16, 3, 1, 1),
+            nn.ReLU(),
+            nn.Conv2d(16, n_channels_out, 3, 1, 1),
+            nn.Softplus()
+        )
+
+    def f(self, t, y_flat):
+        return self.drift_net(y_flat.view(-1, self.C, self.H, self.W)).view(y_flat.shape[0], -1)
+
+    def g(self, t, y_flat):
+        return self.diffusion_net(y_flat.view(-1, self.C, self.H, self.W)).view(y_flat.shape[0], -1)
+
+    def forward(self, u0, t_span=torch.linspace(0, 1, 2)):
+        s = torchsde.sdeint(self, u0.view(u0.shape[0], -1), t_span, method='euler_heun', dt=0.1)
+        mean = s[-1].view(u0.shape)
+        std = self.diffusion_net(mean)
+        return mean, std
+
+# Test function to verify the architecture matches
+def test_spidm_architecture():
+    """Test if the SPIDM architecture matches your saved model."""
+    print("Testing CORRECTED SPIDM architecture...")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    spidm_model_path = "/content/drive/MyDrive/spidm_best_model.pth"
+
+    # Create model with corrected architecture
+    spidm_model = SPIDM(n_channels_in=3, n_channels_out=3, H=17, W=17).to(device)
+
+    try:
+        # Try to load the saved model
+        spidm_state_dict = torch.load(spidm_model_path, map_location=device)
+        spidm_model.load_state_dict(spidm_state_dict)
+        spidm_model.eval()
+        print("✅ SUCCESS! SPIDM model loaded successfully!")
+        print("✅ Architecture matches your saved model perfectly!")
+        return True, spidm_model
+    except Exception as e:
+        print(f"❌ Still doesn't match: {e}")
+        return False, None
+
+# Debug function to verify channel dimensions
+def debug_channel_dimensions():
+    """Debug the channel dimensions to ensure they match."""
+    print("Debugging channel dimensions...")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    spidm_model_path = "/content/drive/MyDrive/spidm_best_model.pth"
+
+    # Create model
+    spidm_model = SPIDM(n_channels_in=3, n_channels_out=3, H=17, W=17).to(device)
+
+    # Load state dict
+    saved_state_dict = torch.load(spidm_model_path, map_location=device)
+    model_state_dict = spidm_model.state_dict()
+
+    print("\nCRITICAL LAYERS COMPARISON:")
+    critical_layers = ['drift_net.up1.conv.double_conv.3.weight', 'drift_net.up2.conv.double_conv.3.weight']
+
+    for layer in critical_layers:
+        if layer in saved_state_dict and layer in model_state_dict:
+            saved_shape = saved_state_dict[layer].shape
+            model_shape = model_state_dict[layer].shape
+            match = "✅" if saved_shape == model_shape else "❌"
+            print(f"{match} {layer}:")
+            print(f"    Saved: {saved_shape}")
+            print(f"    Model: {model_shape}")
+        else:
+            print(f"❌ {layer}: Missing in one of the models")
+
+    return spidm_model
+
+# Complete pipeline with corrected SPIDM
+def run_final_corrected_pipeline():
+    """Run the final corrected pipeline."""
+    print("="*70)
+    print("FINAL CORRECTED SPIDM + SimpleGFNO PIPELINE")
+    print("="*70)
+
+    # Test the architecture first
+    success, spidm_model = test_spidm_architecture()
+
+    if success:
+        print(" SPIDM loaded successfully! Your core contribution is preserved!")
+        print(" Now you can integrate with SimpleGFNO for the complete framework!")
+        return spidm_model
+    else:
+        print("Let's debug the channel dimensions...")
+        debug_model = debug_channel_dimensions()
+        return debug_model
+
+if __name__ == "__main__":
+    # Test the final corrected architecture
+    model = run_final_corrected_pipeline()
+
+# ENHANCED SimpleGFNO ON HYBRID GRAPH WITH COMPREHENSIVE ANALYSIS
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split
+import numpy as np
+import xarray as xr
+import rioxarray
+import rasterio.enums
+from scipy.spatial.distance import pdist, squareform
+from torch_geometric.data import Data
+from tqdm.notebook import tqdm
+import pandas as pd
+import torchsde
+import gc
+import time
+import psutil
+import matplotlib.pyplot as plt
+import seaborn as sns
+from contextlib import contextmanager
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {DEVICE}")
+
+PROCESSED_DATA_PATH = "/content/drive/MyDrive/ERA5_Cairo_Regional_2023.nc"
+SPIDM_MODEL_PATH = "/content/drive/MyDrive/spidm_best_model.pth"
+SENTINEL_PATH = "/content/drive/MyDrive/sentinel_egypt_2023.tif"
+SAVE_PATH = "/content/drive/MyDrive/enhanced_simple_gfno_HYBRID_best_model.pth"
+print(f"Enhanced model will be saved to: {SAVE_PATH}")
+
+class PerformanceMonitor:
+    """Comprehensive performance monitoring for training time, memory usage, and inference speed."""
+    def __init__(self, device):
+        self.device = device
+        self.is_cuda = device.type == 'cuda'
+        self.reset()
+
+    def reset(self):
+        self.training_times = []
+        self.validation_times = []
+        self.memory_usage = []
+        self.gpu_memory_usage = []
+        self.inference_times = []
+        self.total_training_time = 0
+        self.peak_memory = 0
+        self.peak_gpu_memory = 0
+
+    def get_memory_usage(self):
+        process = psutil.Process()
+        cpu_memory = process.memory_info().rss / 1024 / 1024  # MB
+        gpu_memory = 0
+        if self.is_cuda and torch.cuda.is_available():
+            gpu_memory = torch.cuda.memory_allocated() / 1024 / 1024  # MB
+        return cpu_memory, gpu_memory
+
+    @contextmanager
+    def measure_time(self, operation_type='training'):
+        if self.is_cuda:
+            torch.cuda.synchronize()
+        start_time = time.time()
+        cpu_mem_start, gpu_mem_start = self.get_memory_usage()
+
+        try:
+            yield
+        finally:
+            if self.is_cuda:
+                torch.cuda.synchronize()
+            end_time = time.time()
+            cpu_mem_end, gpu_mem_end = self.get_memory_usage()
+            elapsed_time = end_time - start_time
+
+            if operation_type == 'training':
+                self.training_times.append(elapsed_time)
+            elif operation_type == 'validation':
+                self.validation_times.append(elapsed_time)
+            elif operation_type == 'inference':
+                self.inference_times.append(elapsed_time)
+
+            self.memory_usage.append(cpu_mem_end)
+            self.gpu_memory_usage.append(gpu_mem_end)
+            self.peak_memory = max(self.peak_memory, cpu_mem_end)
+            self.peak_gpu_memory = max(self.peak_gpu_memory, gpu_mem_end)
+
+    def get_summary(self):
+        summary = {
+            'total_training_time_minutes': sum(self.training_times) / 60,
+            'avg_epoch_time_seconds': np.mean(self.training_times) if self.training_times else 0,
+            'avg_validation_time_seconds': np.mean(self.validation_times) if self.validation_times else 0,
+            'avg_inference_time_ms': np.mean(self.inference_times) * 1000 if self.inference_times else 0,
+            'peak_cpu_memory_mb': self.peak_memory,
+            'peak_gpu_memory_mb': self.peak_gpu_memory,
+            'avg_cpu_memory_mb': np.mean(self.memory_usage) if self.memory_usage else 0,
+            'avg_gpu_memory_mb': np.mean(self.gpu_memory_usage) if self.gpu_memory_usage else 0,
+        }
+        if self.training_times:
+            summary['training_throughput_samples_per_sec'] = 1.0 / np.mean(self.training_times)
+        if self.inference_times:
+            summary['inference_throughput_samples_per_sec'] = 1.0 / np.mean(self.inference_times)
+        return summary
+
+class ClimateDataset(Dataset):
+    def __init__(self, nc_file_path, variables, n_timesteps_in=1, n_timesteps_out=1):
+        super().__init__()
+        self.ds = xr.open_dataset(nc_file_path)
+        self.data = self.ds[variables].to_array(dim='channel').transpose('valid_time', 'channel', 'latitude', 'longitude')
+        self.mean = self.data.mean(dim=('valid_time', 'latitude', 'longitude')).compute()
+        self.std = self.data.std(dim=('valid_time', 'latitude', 'longitude')).compute()
+        self.data = (self.data - self.mean) / self.std
+        self.n_timesteps_in, self.n_timesteps_out, self.total_timesteps = n_timesteps_in, n_timesteps_out, len(self.data.valid_time)
+
+    def __len__(self):
+        return self.total_timesteps - (self.n_timesteps_in + self.n_timesteps_out) + 1
+
+    def __getitem__(self, idx):
+        start, mid, end = idx, idx + self.n_timesteps_in, idx + self.n_timesteps_in + self.n_timesteps_out
+        X = torch.from_numpy(self.data.isel(valid_time=slice(start, mid))[0].values).float()
+        Y = torch.from_numpy(self.data.isel(valid_time=slice(mid, end))[0].values).float()
+        return X, Y
+
+class SimpleGFNO(nn.Module):
+    def __init__(self, in_channels, out_channels, num_modes, U, U_T):
+        super().__init__()
+        self.register_buffer('U', U)
+        self.register_buffer('U_T', U_T)
+        self.num_modes = num_modes
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.spectral_kernel = nn.Linear(self.in_channels, self.out_channels)
+
+    def forward(self, graph):
+        x = graph.x
+        x_hat = torch.matmul(self.U_T, x)
+        modes = x_hat[:self.num_modes, :]
+        filtered = self.spectral_kernel(modes)
+        out_hat = torch.zeros(x.shape[0], self.out_channels, device=x.device, dtype=x.dtype)
+        out_hat[:self.num_modes, :] = filtered
+        return torch.matmul(self.U, out_hat)
+
+class GFNODataset(Dataset):
+    def __init__(self, c_data, s_model, ndvi_map, device):
+        self.c, self.s, self.n, self.d = c_data, s_model, ndvi_map.to(device), device
+        self.H, self.W = ndvi_map.shape[0], ndvi_map.shape[1]
+
+    def __len__(self):
+        return len(self.c)
+
+    @torch.no_grad()
+    def __getitem__(self, idx):
+        cX, cY = self.c[idx]
+        cX = cX.unsqueeze(0).to(self.d)
+        cor, _ = self.s(cX)
+        cor_flat = cor.squeeze(0).permute(1, 2, 0).reshape(-1, self.c.data.shape[1])
+        n_flat = self.n.reshape(-1, 1)
+        node_f = torch.cat([cor_flat, n_flat], dim=-1)
+        target = cY[0].reshape(-1, 1)
+        return node_f.cpu(), target.cpu()
+
+print("--- All prerequisite class definitions loaded. ---")
+
+def train_epoch_enhanced(model, train_loader, optimizer, loss_fn, device, monitor, graph_data):
+    """Enhanced training epoch with comprehensive monitoring."""
+    model.train()
+    total_train_loss = 0
+    nan_count = 0
+
+    with monitor.measure_time('training'):
+        train_bar = tqdm(train_loader, desc="Training", leave=False)
+
+        for node_features, target_temp in train_bar:
+            try:
+                # Memory cleanup
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+
+                graph_data.x = node_features.squeeze(0).to(device)
+                targets = target_temp.squeeze(0).to(device)
+
+                # Check for NaN inputs
+                if torch.isnan(graph_data.x).any() or torch.isnan(targets).any():
+                    nan_count += 1
+                    continue
+
+                optimizer.zero_grad()
+                prediction = model(graph_data)
+
+                # Check for NaN predictions
+                if torch.isnan(prediction).any():
+                    nan_count += 1
+                    continue
+
+                loss = loss_fn(prediction, targets)
+
+                # Check for NaN loss
+                if torch.isnan(loss) or torch.isinf(loss):
+                    nan_count += 1
+                    continue
+
+                loss.backward()
+
+                # Gradient clipping for stability
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                optimizer.step()
+                total_train_loss += loss.item()
+
+                # Update progress bar with memory info
+                cpu_mem, gpu_mem = monitor.get_memory_usage()
+                train_bar.set_postfix({
+                    'loss': f'{loss.item():.6f}',
+                    'mem': f'{cpu_mem:.0f}MB',
+                    'gpu': f'{gpu_mem:.0f}MB' if gpu_mem > 0 else 'N/A',
+                    'nan_batches': nan_count
+                })
+
+            except Exception as e:
+                print(f"Error in training batch: {e}")
+                nan_count += 1
+                continue
+
+    if nan_count > 0:
+        print(f"Warning: {nan_count} training batches skipped due to numerical issues")
+
+    return total_train_loss / max(len(train_loader) - nan_count, 1)
+
+def validate_epoch_enhanced(model, val_loader, loss_fn, device, monitor, graph_data):
+    """Enhanced validation epoch with comprehensive monitoring."""
+    model.eval()
+    total_val_loss = 0
+    nan_count = 0
+
+    with monitor.measure_time('validation'):
+        with torch.no_grad():
+            val_bar = tqdm(val_loader, desc="Validation", leave=False)
+
+            for node_features, target_temp in val_bar:
+                try:
+                    graph_data.x = node_features.squeeze(0).to(device)
+                    targets = target_temp.squeeze(0).to(device)
+
+                    # Check for NaN inputs
+                    if torch.isnan(graph_data.x).any() or torch.isnan(targets).any():
+                        nan_count += 1
+                        continue
+
+                    prediction = model(graph_data)
+
+                    # Check for NaN predictions
+                    if torch.isnan(prediction).any():
+                        nan_count += 1
+                        continue
+
+                    val_loss = loss_fn(prediction, targets)
+
+                    # Check for NaN loss
+                    if torch.isnan(val_loss) or torch.isinf(val_loss):
+                        nan_count += 1
+                        continue
+
+                    total_val_loss += val_loss.item()
+
+                    val_bar.set_postfix({
+                        'loss': f'{val_loss.item():.6f}',
+                        'nan_batches': nan_count
+                    })
+
+                except Exception as e:
+                    nan_count += 1
+                    continue
+
+    if nan_count > 0:
+        print(f"Warning: {nan_count} validation batches skipped due to numerical issues")
+
+    return total_val_loss / max(len(val_loader) - nan_count, 1)
+
+def evaluate_model_comprehensive(model, val_loader, climate_dataset, device, graph_data):
+    """Comprehensive model evaluation with multiple metrics."""
+    model.eval()
+
+    all_predictions = []
+    all_targets = []
+    temp_mean = climate_dataset.mean[0].item()  # t2m mean
+    temp_std = climate_dataset.std[0].item()    # t2m std
+
+    print("Running comprehensive evaluation...")
+
+    with torch.no_grad():
+        for node_features, targets in tqdm(val_loader, desc="Evaluating"):
+            try:
+                graph_data.x = node_features.squeeze(0).to(device)
+                pred_norm = model(graph_data)
+
+                # Denormalize predictions and targets
+                pred_denorm = pred_norm.cpu() * temp_std + temp_mean
+                target_denorm = targets.squeeze(0) * temp_std + temp_mean
+
+                all_predictions.append(pred_denorm)
+                all_targets.append(target_denorm)
+            except:
+                continue
+
+    # Concatenate all predictions and targets
+    predictions = torch.cat(all_predictions)
+    targets = torch.cat(all_targets)
+
+    # Compute metrics
+    mse = torch.mean((predictions - targets)**2)
+    rmse = torch.sqrt(mse)
+    mae = torch.mean(torch.abs(predictions - targets))
+
+    print(f"\n=== EVALUATION RESULTS ===")
+    print(f"RMSE: {rmse:.4f} K")
+    print(f"MAE:  {mae:.4f} K")
+    print(f"Samples evaluated: {len(predictions)}")
+
+    return predictions, targets, rmse.item(), mae.item()
+
+def benchmark_inference_speed(model, val_loader, device, graph_data, num_samples=100):
+    """Detailed inference speed benchmarking."""
+    print(f"Benchmarking inference speed on {num_samples} samples...")
+
+    model.eval()
+
+    data_loading_times = []
+    model_inference_times = []
+    total_times = []
+
+    sample_count = 0
+
+    for node_features, targets in val_loader:
+        if sample_count >= num_samples:
+            break
+
+        # Measure data loading/preprocessing time
+        data_start = time.time()
+        graph_data.x = node_features.squeeze(0).to(device)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        data_time = time.time() - data_start
+        data_loading_times.append(data_time)
+
+        # Measure pure model inference time
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        inference_start = time.time()
+
+        with torch.no_grad():
+            output = model(graph_data)
+
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        inference_time = time.time() - inference_start
+        model_inference_times.append(inference_time)
+
+        total_times.append(data_time + inference_time)
+        sample_count += 1
+
+    # Calculate statistics
+    stats = {
+        'avg_data_loading_ms': np.mean(data_loading_times) * 1000,
+        'avg_model_inference_ms': np.mean(model_inference_times) * 1000,
+        'avg_total_time_ms': np.mean(total_times) * 1000,
+        'std_inference_ms': np.std(model_inference_times) * 1000,
+        'min_inference_ms': np.min(model_inference_times) * 1000,
+        'max_inference_ms': np.max(model_inference_times) * 1000,
+        'throughput_samples_per_sec': 1.0 / np.mean(total_times),
+        'model_only_throughput': 1.0 / np.mean(model_inference_times)
+    }
+
+    return stats, model_inference_times  
+
+
+# ABLATION STUDIES EVALUATION AND VISUALIZATION
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import xarray as xr
+import rioxarray
+import rasterio.enums
+from scipy.spatial.distance import pdist, squareform
+from torch_geometric.data import Data
+from tqdm.notebook import tqdm
+import torchsde
+import gc
+import time
+import psutil
+import warnings
+warnings.filterwarnings('ignore')
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"--- Running on device: {DEVICE} ---")
+
+
+# Your main model for comparison
+PROCESSED_DATA_PATH = "/content/drive/MyDrive/ERA5_Cairo_Regional_2023.nc"
+SENTINEL_PATH = "/content/drive/MyDrive/sentinel_egypt_2023.tif"
+NO_SPIDM_SAVE_PATH = "/content/drive/MyDrive/ablation_no_spidm_best_model.pth"
+NO_PHYSICS_SPIDM_PATH = "/content/drive/MyDrive/ablation_no_physics_GFNO_best_model.pth"
+NO_NDVI_GFNO_PATH = "/content/drive/MyDrive/ablation_no_ndvi_GFNO_best_model.pth"
+MAIN_MODEL_PATH = "/content/drive/MyDrive/spidm_best_model.pth"
+
+class ClimateDataset(Dataset):
+    def __init__(self, nc_f, v):
+        super().__init__()
+        try:
+            self.ds = xr.open_dataset(nc_f, engine='netcdf4')
+        except:
+            self.ds = xr.open_dataset(nc_f, engine='h5netcdf')
+        self.data = self.ds[v].to_array('channel').transpose('valid_time','channel','latitude','longitude')
+        self.mean = self.data.mean(('valid_time','latitude','longitude')).compute()
+        self.std = self.data.std(('valid_time','latitude','longitude')).compute()
+        self.data = (self.data - self.mean) / self.std
+        self.T = len(self.data.valid_time)
+    def __len__(self):
+        return self.T - 2
+    def __getitem__(self, i):
+        X = torch.from_numpy(self.data.isel(valid_time=i).values).float()
+        Y = torch.from_numpy(self.data.isel(valid_time=i+1).values).float()
+        return X, Y
+
+class DoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels, mid_channels=None):
+        super().__init__()
+        if not mid_channels: mid_channels = out_channels
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+    def forward(self, x): return self.double_conv(x)
+
+class Down(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.maxpool_conv = nn.Sequential(nn.MaxPool2d(2), DoubleConv(in_channels, out_channels))
+    def forward(self, x): return self.maxpool_conv(x)
+
+class Up(nn.Module):
+    def __init__(self, in_channels, out_channels, bilinear=True):
+        super().__init__()
+        if bilinear:
+            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+            self.conv = DoubleConv(in_channels, out_channels, in_channels // 2)
+        else:
+            self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
+            self.conv = DoubleConv(in_channels, out_channels)
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
+        x1 = nn.functional.pad(x1, [diffX//2, diffX - diffX//2, diffY//2, diffY - diffY//2])
+        return self.conv(torch.cat([x2, x1], dim=1))
+
+class OutConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, 1)
+    def forward(self, x): return self.conv(x)
+
+class UNet(nn.Module):
+    def __init__(self, n_channels_in, n_channels_out, bilinear=True):
+        super().__init__()
+        self.inc = DoubleConv(n_channels_in, 64)
+        self.down1 = Down(64, 128)
+        self.down2 = Down(128, 256)
+        factor = 2 if bilinear else 1
+        self.down3 = Down(256, 512 // factor)
+        self.up1 = Up(512, 256 // factor, bilinear)
+        self.up2 = Up(256, 128 // factor, bilinear)
+        self.up3 = Up(128, 64, bilinear)
+        self.outc = OutConv(64, n_channels_out)
+    def forward(self, x):
+        x1 = self.inc(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        x = self.up1(x4, x3)
+        x = self.up2(x, x2)
+        x = self.up3(x, x1)
+        return self.outc(x)
+
+class SPIDM(nn.Module):
+    sde_type = 'stratonovich'
+    noise_type = 'diagonal'
+    def __init__(self, in_channels, out_channels, H, W):
+        super().__init__()
+        self.C, self.H, self.W = in_channels, H, W
+        self.drift_net = UNet(in_channels, out_channels)
+        self.diffusion_net = nn.Sequential(
+            nn.Conv2d(in_channels, 16, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, out_channels, 3, padding=1),
+            nn.Softplus()
+        )
+    def f(self, t, y):
+        return self.drift_net(y.reshape(-1, self.C, self.H, self.W)).reshape(y.shape[0], -1)
+    def g(self, t, y):
+        return self.diffusion_net(y.reshape(-1, self.C, self.H, self.W)).reshape(y.shape[0], -1)
+    def forward(self, u, ts=torch.linspace(0, 1, 2)):
+        s = torchsde.sdeint(self, u.reshape(u.shape[0], -1), ts, dt=0.1)
+        m = s[-1].reshape(u.shape)
+        return m, self.diffusion_net(m)
+
+class GFNOLayer(nn.Module):
+    def __init__(self, i, o, m, U, UT):
+        super().__init__()
+        self.register_buffer('U', U)
+        self.register_buffer('U_T', UT)
+        self.num_modes = m
+        self.spectral_kernel = nn.Linear(i, o)
+    def forward(self, x):
+        xh = torch.matmul(self.U_T, x)
+        fh = self.spectral_kernel(xh[:self.num_modes, :])
+        out_hat = torch.zeros(x.shape[0], self.spectral_kernel.out_features, device=x.device, dtype=x.dtype)
+        out_hat[:self.num_modes, :] = fh
+        return torch.matmul(self.U, out_hat)
+
+class DeepGFNO(nn.Module):
+    def __init__(self, in_features, out_features, hidden_features, num_layers, num_modes, U, UT):
+        super().__init__()
+        self.lifting = nn.Linear(in_features, hidden_features)
+        self.layers = nn.ModuleList([GFNOLayer(hidden_features, hidden_features, num_modes, U, UT) for _ in range(num_layers)])
+        self.projection = nn.Sequential(nn.Linear(hidden_features, hidden_features*2), nn.GELU(), nn.Linear(hidden_features*2, out_features))
+    def forward(self, g):
+        x = self.lifting(g.x)
+        for l in self.layers: x = x + l(x)
+        x = torch.relu(x)
+        return self.projection(x)
+
+class GFNODataset_NoSPIDM(Dataset):
+    def __init__(self, climate_dataset, aggregated_ndvi):
+        super().__init__()
+        self.cd = climate_dataset
+        self.n = aggregated_ndvi.cpu()
+        self.H, self.W = self.n.shape[0], self.n.shape[1]
+        self.N_C = self.cd.data.values.shape[1]
+
+    def __len__(self): return len(self.cd)
+
+    @torch.no_grad()
+    def __getitem__(self, i):
+        X, Y = self.cd[i]
+        cf = X.permute(1, 2, 0).reshape(-1, self.N_C)
+        nf = self.n.reshape(-1, 1)
+        node_features = torch.cat([cf, nf], -1)
+        target = Y[0].reshape(-1, 1)
+        return node_features, target
+
+class GFNODataset_NoNDVI(Dataset):
+    def __init__(self, cd, spidm_model):
+        self.c = cd
+        self.s = spidm_model.cpu().eval()
+        self.H, self.W = 17, 17
+        self.N_C = self.s.C
+
+    def __len__(self): return len(self.c)
+
+    @torch.no_grad()
+    def __getitem__(self, i):
+        X, Y = self.c[i]
+        cor, _ = self.s(X.unsqueeze(0))
+        cf = cor.squeeze(0).permute(1, 2, 0).reshape(-1, self.N_C)
+        t = Y[0].reshape(-1, 1)
+        return cf, t
+
+class GFNODataset_WithSPIDM(Dataset):
+    def __init__(self, climate_dataset, spidm_model, aggregated_ndvi):
+        super().__init__()
+        self.cd = climate_dataset
+        self.spidm = spidm_model.cpu().eval()
+        self.n = aggregated_ndvi.cpu()
+        self.H, self.W = self.n.shape[0], self.n.shape[1]
+        self.N_C = self.spidm.C
+
+    def __len__(self): return len(self.cd)
+
+    @torch.no_grad()
+    def __getitem__(self, i):
+        X, Y = self.cd[i]
+        corrected, _ = self.spidm(X.unsqueeze(0))
+        cf = corrected.squeeze(0).permute(1, 2, 0).reshape(-1, self.N_C)
+        nf = self.n.reshape(-1, 1)
+        node_features = torch.cat([cf, nf], -1)
+        target = Y[0].reshape(-1, 1)
+        return node_features, target
+
+
+def evaluate_model_comprehensive(model, val_loader, climate_dataset, device, graph_data, model_name):
+    """Comprehensive model evaluation with multiple metrics."""
+    model.eval()
+
+    all_predictions = []
+    all_targets = []
+    temp_mean = climate_dataset.mean[0].item()
+    temp_std = climate_dataset.std[0].item()
+
+    print(f"\n--- Evaluating {model_name} ---")
+
+    inference_times = []
+
+    with torch.no_grad():
+        for node_features, targets in tqdm(val_loader, desc=f"Evaluating {model_name}"):
+            try:
+                # Time inference
+                start_time = time.time()
+
+                graph_data.x = node_features.squeeze(0).to(device)
+                pred_norm = model(graph_data)
+
+                if device.type == 'cuda':
+                    torch.cuda.synchronize()
+                inference_time = time.time() - start_time
+                inference_times.append(inference_time)
+
+                # Denormalize predictions and targets
+                pred_denorm = pred_norm.cpu() * temp_std + temp_mean
+                target_denorm = targets.squeeze(0) * temp_std + temp_mean
+
+                all_predictions.append(pred_denorm)
+                all_targets.append(target_denorm)
+            except Exception as e:
+                print(f"Error in evaluation: {e}")
+                continue
+
+    # Concatenate all predictions and targets
+    predictions = torch.cat(all_predictions)
+    targets = torch.cat(all_targets)
+
+    # Compute metrics
+    mse = torch.mean((predictions - targets)**2)
+    rmse = torch.sqrt(mse)
+    mae = torch.mean(torch.abs(predictions - targets))
+
+    # Additional metrics
+    std_pred = torch.std(predictions)
+    std_target = torch.std(targets)
+
+    # R-squared
+    ss_res = torch.sum((targets - predictions) ** 2)
+    ss_tot = torch.sum((targets - torch.mean(targets)) ** 2)
+    r2 = 1 - (ss_res / ss_tot)
+
+    # Inference stats
+    avg_inference_time = np.mean(inference_times) * 1000  # Convert to ms
+    std_inference_time = np.std(inference_times) * 1000
+
+    print(f"\n=== {model_name} EVALUATION RESULTS ===")
+    print(f"RMSE: {rmse:.4f} K")
+    print(f"MAE:  {mae:.4f} K")
+    print(f"MSE:  {mse:.6f} K²")
+    print(f"R²:   {r2:.4f}")
+    print(f"Std Pred: {std_pred:.4f} K")
+    print(f"Std Target: {std_target:.4f} K")
+    print(f"Avg Inference Time: {avg_inference_time:.2f} ± {std_inference_time:.2f} ms")
+    print(f"Samples evaluated: {len(predictions)}")
+
+    return {
+        'predictions': predictions,
+        'targets': targets,
+        'rmse': rmse.item(),
+        'mae': mae.item(),
+        'mse': mse.item(),
+        'r2': r2.item(),
+        'std_pred': std_pred.item(),
+        'std_target': std_target.item(),
+        'avg_inference_time_ms': avg_inference_time,
+        'std_inference_time_ms': std_inference_time,
+        'num_samples': len(predictions)
+    }
+
+def create_ablation_comparison_plots(results_dict):
+    """Create comprehensive comparison plots for ablation studies."""
+
+    fig, axes = plt.subplots(2, 3, figsize=(20, 12))
+
+    # Extract metrics for plotting
+    models = list(results_dict.keys())
+    rmse_values = [results_dict[model]['rmse'] for model in models]
+    mae_values = [results_dict[model]['mae'] for model in models]
+    r2_values = [results_dict[model]['r2'] for model in models]
+    inference_times = [results_dict[model]['avg_inference_time_ms'] for model in models]
+
+    # Color scheme for different ablations
+    colors = ['#2E86AB', '#A23B72', '#F18F01', '#C73E1D']
+
+    # 1. RMSE Comparison
+    bars1 = axes[0, 0].bar(models, rmse_values, color=colors, alpha=0.7, edgecolor='black')
+    axes[0, 0].set_ylabel('RMSE (K)')
+    axes[0, 0].set_title('Root Mean Square Error Comparison')
+    axes[0, 0].tick_params(axis='x', rotation=45)
+    axes[0, 0].grid(True, alpha=0.3)
+
+    # Add value labels on bars
+    for i, (bar, value) in enumerate(zip(bars1, rmse_values)):
+        axes[0, 0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.001,
+                       f'{value:.4f}', ha='center', va='bottom', fontweight='bold')
+
+    # 2. MAE Comparison
+    bars2 = axes[0, 1].bar(models, mae_values, color=colors, alpha=0.7, edgecolor='black')
+    axes[0, 1].set_ylabel('MAE (K)')
+    axes[0, 1].set_title('Mean Absolute Error Comparison')
+    axes[0, 1].tick_params(axis='x', rotation=45)
+    axes[0, 1].grid(True, alpha=0.3)
+
+    for i, (bar, value) in enumerate(zip(bars2, mae_values)):
+        axes[0, 1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.001,
+                       f'{value:.4f}', ha='center', va='bottom', fontweight='bold')
+
+    # 3. R² Comparison
+    bars3 = axes[0, 2].bar(models, r2_values, color=colors, alpha=0.7, edgecolor='black')
+    axes[0, 2].set_ylabel('R² Score')
+    axes[0, 2].set_title('R² Score Comparison')
+    axes[0, 2].tick_params(axis='x', rotation=45)
+    axes[0, 2].grid(True, alpha=0.3)
+
+    for i, (bar, value) in enumerate(zip(bars3, r2_values)):
+        axes[0, 2].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                       f'{value:.4f}', ha='center', va='bottom', fontweight='bold')
+
+    # 4. Inference Time Comparison
+    bars4 = axes[1, 0].bar(models, inference_times, color=colors, alpha=0.7, edgecolor='black')
+    axes[1, 0].set_ylabel('Inference Time (ms)')
+    axes[1, 0].set_title('Average Inference Time Comparison')
+    axes[1, 0].tick_params(axis='x', rotation=45)
+    axes[1, 0].grid(True, alpha=0.3)
+
+    for i, (bar, value) in enumerate(zip(bars4, inference_times)):
+        axes[1, 0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1,
+                       f'{value:.2f}', ha='center', va='bottom', fontweight='bold')
+
+    # 5. Scatter Plot Comparison (showing prediction accuracy)
+    for i, model in enumerate(models):
+        preds = results_dict[model]['predictions'].numpy().flatten()
+        targets = results_dict[model]['targets'].numpy().flatten()
+
+        # Sample for visualization (to avoid overcrowding)
+        indices = np.random.choice(len(preds), min(1000, len(preds)), replace=False)
+        axes[1, 1].scatter(targets[indices], preds[indices], alpha=0.5, s=10,
+                          color=colors[i], label=model)
+
+    # Perfect prediction line
+    min_val = min([results_dict[model]['targets'].min() for model in models])
+    max_val = max([results_dict[model]['targets'].max() for model in models])
+    axes[1, 1].plot([min_val, max_val], [min_val, max_val], 'k--', linewidth=2, alpha=0.7)
+    axes[1, 1].set_xlabel('Ground Truth (K)')
+    axes[1, 1].set_ylabel('Predictions (K)')
+    axes[1, 1].set_title('Prediction Accuracy Comparison')
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, alpha=0.3)
+
+    # 6. Performance Summary Table
+    axes[1, 2].axis('off')
+
+    # Create performance summary
+    summary_data = []
+    for model in models:
+        summary_data.append([
+            model,
+            f"{results_dict[model]['rmse']:.4f}",
+            f"{results_dict[model]['mae']:.4f}",
+            f"{results_dict[model]['r2']:.4f}",
+            f"{results_dict[model]['avg_inference_time_ms']:.2f}"
+        ])
+
+    table = axes[1, 2].table(cellText=summary_data,
+                           colLabels=['Model', 'RMSE (K)', 'MAE (K)', 'R²', 'Time (ms)'],
+                           cellLoc='center',
+                           loc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1.2, 2)
+
+    # Color the header
+    for i in range(len(table.get_celld())):
+        if i < 5:  # Header row
+            table.get_celld()[(0, i)].set_facecolor('#E8E8E8')
+            table.get_celld()[(0, i)].set_text_props(weight='bold')
+
+    axes[1, 2].set_title('Performance Summary', pad=20, fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig('/content/drive/MyDrive/ablation_comparison.png', dpi=300, bbox_inches='tight')
+    plt.show()
