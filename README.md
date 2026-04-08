@@ -32,7 +32,7 @@ Alexandria, Egypt, achieving:
 ## Repository Structure
 
 ```
-├── Results.ipynb              # Main pipeline notebook (full implementation)
+├── Model             # Main pipeline notebook (full implementation)
 ├── requirements.txt           # Python dependencies
 ├── data/
 │   └── README_data.md         # Instructions to download ERA5 and Sentinel-2
