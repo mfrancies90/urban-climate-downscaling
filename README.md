@@ -133,8 +133,9 @@ If you use this code in your research, please cite:
 ## Contact
 
 **Mariam Labib**  
-PhD Candidate, Elsewedy University of Technology  
+PhD Candidate, Manosura University
+Assistant Lecturer, Elsewedy University of Technology  
 Cairo, Egypt  
 📧 mariamlabib90@std.mans.edu.eg  
-🔗 [Google Scholar]([https://scholar.google.com/citations?user=ljk1Yv0AAAAJ](https://scholar.google.com/citations?user=ljk1Yv0AAAAJ&hl=en&oi=ao))
+🔗 [Google Scholar]([[https://scholar.google.com/citations?user=ljk1Yv0AAAAJ])
 ```
